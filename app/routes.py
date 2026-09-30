@@ -17,6 +17,8 @@ from .schemas import (
     ProductionIn,
     ProductionOut,
     RawBatchIn,
+    ReviewIn,
+    ReviewOut,
     SuspectIn,
 )
 
@@ -146,6 +148,39 @@ def flag_suspect(
 
     def action() -> tuple[int, dict[str, Any]]:
         return status.HTTP_200_OK, service.mark_suspect(session, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
+
+
+@router.post("/reviews", response_model=ReviewOut, status_code=status.HTTP_200_OK)
+def review_false_positive(
+    body: ReviewIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    # 复核撤销为显式业务动作：必须携带 Idempotency-Key 以支持安全重试
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_200_OK, service.review_false_positive(session, body)
 
     code, result = service.idempotent(
         session,

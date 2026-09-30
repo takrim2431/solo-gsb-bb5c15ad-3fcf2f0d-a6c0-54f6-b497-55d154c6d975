@@ -35,6 +35,14 @@ def batch_quarantined(batch_no: str) -> AppError:
     )
 
 
+def batch_not_suspect(batch_no: str) -> AppError:
+    return AppError(
+        "BATCH_NOT_SUSPECT",
+        f"批次 {batch_no!r} 当前未被标记为疑似污染：编号不存在或已撤销复核时不得重复复核",
+        409,
+    )
+
+
 def insufficient(batch_no: str, requested: object, remaining: object) -> AppError:
     return AppError(
         "INSUFFICIENT_BALANCE",

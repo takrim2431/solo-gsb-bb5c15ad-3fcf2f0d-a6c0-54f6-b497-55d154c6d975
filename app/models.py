@@ -104,6 +104,28 @@ class ProductionInput(Base):
     )
 
 
+class ContaminationReview(Base):
+    """质检复核记录：确认某疑似批次为误报后撤销其疑似标记。
+
+    每次成功复核落一条，便于审计；隔离状态的重算结果体现在 batches 表。
+    """
+
+    __tablename__ = "contamination_reviews"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    note: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_contam_review_batch", "batch_no"),
+    )
+
+
 class IdempotencyKey(Base):
     """请求幂等记录。
 

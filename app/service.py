@@ -7,13 +7,13 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import bindparam, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import errors
-from .models import Batch, IdempotencyKey, Production, ProductionInput
-from .schemas import ProductionIn, RawBatchIn, SuspectIn
+from .models import Batch, ContaminationReview, IdempotencyKey, Production, ProductionInput
+from .schemas import ProductionIn, RawBatchIn, ReviewIn, SuspectIn
 
 # ---------------------------------------------------------------- 幂等支持
 
@@ -350,4 +350,124 @@ def mark_suspect(session: Session, data: SuspectIn) -> dict[str, Any]:
         "is_suspect": True,
         "affected_batch_nos": descendant_nos,
         "newly_quarantined": newly,
+    }
+
+
+# ---------------------------------------------------------------- 质检复核
+
+
+def _lock_subtree_batches(
+    session: Session, nos: list[str]
+) -> dict[str, Batch]:
+    """按编号排序锁定一批批次行（PG FOR UPDATE；SQLite 由写事务锁覆盖）。
+
+    固定加锁顺序避免跨事务死锁；必须在这些行上持锁后才能重算隔离状态，
+    否则与生产/标记并发时可能发生丢失更新。
+    """
+    if not nos:
+        return {}
+    ordered = sorted(set(nos))
+    stmt = select(Batch).where(Batch.batch_no.in_(ordered))
+    if session.get_bind().dialect.name == "postgresql":
+        stmt = stmt.with_for_update()
+    rows = session.execute(stmt).scalars().all()
+    return {b.batch_no: b for b in rows}
+
+
+# 在目标集合 S（复核批次 + 其全部后代）内重算隔离：
+# 自身疑似，或沿谱系上溯能到达任一疑似批次（该祖先可在 S 之外，例如混料的
+# 另一疑似来源），即为隔离。
+_QUARANTINE_IN_SET_SQL = f"""
+WITH RECURSIVE
+  seed(x) AS (
+      SELECT batch_no FROM batches WHERE batch_no IN :nos
+  ),
+  up(x) AS (
+      SELECT x FROM seed
+      UNION
+      SELECT e.parent_no FROM up u JOIN ({_EDGE_CTE}) e ON e.child_no = u.x
+  ),
+  hit(x) AS (
+      SELECT u.x FROM up u JOIN batches b ON b.batch_no = u.x
+      WHERE b.is_suspect = true
+  ),
+  down(x) AS (
+      SELECT x FROM hit
+      UNION
+      SELECT e.child_no FROM down d JOIN ({_EDGE_CTE}) e ON e.parent_no = d.x
+  )
+SELECT DISTINCT d.x AS batch_no
+FROM down d JOIN seed s ON s.x = d.x
+"""
+
+
+def _quarantined_nos_within(session: Session, nos: list[str]) -> set[str]:
+    """返回集合 nos 中重算后应处于隔离状态的批次编号。"""
+    if not nos:
+        return set()
+    stmt = text(_QUARANTINE_IN_SET_SQL).bindparams(
+        bindparam("nos", value=nos, expanding=True)
+    )
+    return {r._mapping["batch_no"] for r in session.execute(stmt).all()}
+
+
+def review_false_positive(session: Session, data: ReviewIn) -> dict[str, Any]:
+    """质检复核：确认疑似批次为误报，撤销疑似标记并重算子树隔离状态。
+
+    - 只接受当前仍被标记疑似的批次：不存在报 404，已撤销（非疑似）报 409，
+      两种失败都不改变任何状态（失败也不固化幂等记录）；
+    - 先撤销该批次疑似标记，再对“该批次 + 全部后代”按
+      “自身或任一祖先疑似即隔离”重算；混料后代若另有疑似来源仍保持隔离；
+    - 全程行锁串行化，与污染标记、生产投料的并发结果等同某一串行顺序。
+    """
+    root = _lock_batch(session, data.batch_no)
+    if root is None:
+        raise errors.batch_not_found(data.batch_no)
+    if not root.is_suspect:
+        raise errors.batch_not_suspect(data.batch_no)
+
+    # 取后代集合 → 锁行 → 再取一次：与并发提交的生产收敛到稳定闭包
+    # （PG 下其在 S 中的来源行也被本事务锁住，提交时等待；第二次 CTE 即可见）。
+    locked: dict[str, Batch] = {root.batch_no: root}
+    while True:
+        descendant_rows = _descendant_rows(session, data.batch_no)
+        descendant_nos = [r["batch_no"] for r in descendant_rows]
+        subtree = _lock_subtree_batches(session, descendant_nos)
+        new_rows = {no for no in subtree if no not in locked}
+        locked.update(subtree)
+        if not new_rows:
+            break
+
+    descendant_nos = sorted(descendant_nos)
+    subtree_nos = [data.batch_no, *descendant_nos]
+
+    # 撤销疑似标记后重算：root 自身的更新必须先落库（autoflush 对原生 SQL 不生效），
+    # 后续 CTE 才能读到最新状态
+    root.is_suspect = False
+    session.flush()
+    quarantined = _quarantined_nos_within(session, subtree_nos)
+
+    released: list[str] = []
+    for no in subtree_nos:
+        batch = locked[no]
+        should = no in quarantined
+        if batch.is_quarantined and not should:
+            released.append(no)
+        batch.is_quarantined = should
+
+    session.add(
+        ContaminationReview(batch_no=data.batch_no, note=data.note)
+    )
+    session.flush()
+    released.sort()
+
+    return {
+        "reviewed": {
+            "batch_no": root.batch_no,
+            "is_suspect": root.is_suspect,
+            "is_quarantined": root.is_quarantined,
+            "review_note": data.note,
+        },
+        "affected_descendant_nos": descendant_nos,
+        "released_batch_nos": released,
     }

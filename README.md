@@ -1,7 +1,8 @@
 # 批次追溯服务（batch-trace）
 
 面向小型食品加工厂的**本地批次追溯服务**：登记原料批次、记录生产投料与产出、
-查询批次余量与上下游谱系，并在发现疑似污染批次时找出并隔离全部后代产出。
+查询批次余量与上下游谱系，在发现疑似污染批次时找出并隔离全部后代产出，
+并支持质检复核确认误报后撤销疑似标记、按谱系重算隔离状态。
 
 - 语言/框架：Python 3.12 + FastAPI + SQLAlchemy 2
 - 关系数据库：PostgreSQL 16（Docker Compose 一键启动）；无数据库时自动回退本地 SQLite 文件库
@@ -81,6 +82,7 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 | GET | `/batches/{batch_no}` | 查询批次余量与状态 |
 | GET | `/batches/{batch_no}/lineage` | 查询上下游谱系（递归） |
 | POST | `/contamination` | 标记疑似污染批次，返回并隔离全部后代 |
+| POST | `/reviews` | 质检复核：确认疑似批次为误报，撤销标记并重算子树隔离 |
 
 ### 业务规则
 
@@ -90,10 +92,17 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 4. 来源不存在、用量无效（非正数）、单位不一致或余量不足时，**整笔拒绝，不改变任何余量**。
 5. 污染规则：标记某批次疑似污染后，其全部直接/间接产出（混料后代）**整体隔离**；
    隔离批次（含疑似批次本身）**不得再投料**，提交生产时整笔拒绝。
-6. 幂等：同一 `Idempotency-Key` + 同一请求体重试，返回首次的状态码与响应体、不重复扣减；
+6. 质检复核（撤销误报）：操作员提交**批次编号 + 复核说明**撤销该批次的疑似标记，
+   并对“该批次 + 其全部后代”重算隔离——只要批次自身或**任一祖先**仍被标记疑似就继续隔离，
+   否则解除；混料后代不会因一个来源解除而忽略另一疑似来源。只接受**当前疑似**批次：
+   编号不存在返回 `SOURCE_NOT_FOUND`(404)，从未疑似或已撤销返回 `BATCH_NOT_SUSPECT`(409)，
+   两种失败都不改变任何状态。批次查询与谱系结果会同步反映隔离变化。
+7. 幂等：同一 `Idempotency-Key` + 同一请求体重试，返回首次的状态码与响应体、不重复扣减；
    同一 key + 不同请求体返回 `409 IDEMPOTENCY_CONFLICT`。
-7. 并发：生产提交在单事务内对来源批次加行锁（PostgreSQL `SELECT ... FOR UPDATE`；
-   SQLite 以 `BEGIN IMMEDIATE` 串行化写事务），并发提交**不会超用**同一批次余量。
+8. 并发：生产提交在单事务内对来源批次加行锁（PostgreSQL `SELECT ... FOR UPDATE`；
+   SQLite 以 `BEGIN IMMEDIATE` 串行化写事务），复核与污染标记同样对子树行加锁，
+   复核、污染标记与生产投料并发的结果**等同某一串行顺序**，并发提交不会超用同一批次余量，
+   隔离批次绝不会被投料。
 
 ### 错误响应格式
 
@@ -103,7 +112,8 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 
 常见错误码：`SOURCE_NOT_FOUND`(404)、`BATCH_NO_REUSED`(409)、`INSUFFICIENT_BALANCE`(409)、
 `UNIT_MISMATCH`(422)、`OUTPUT_EXCEEDS_INPUT`(422)、`VALIDATION_ERROR`(422)、
-`BATCH_QUARANTINED`(409)、`IDEMPOTENCY_CONFLICT`(409)。
+`BATCH_QUARANTINED`(409)、`BATCH_NOT_SUSPECT`(409)、`IDEMPOTENCY_CONFLICT`(409)、
+`IDEMPOTENCY_KEY_REQUIRED`(400)。
 
 ---
 
@@ -215,7 +225,66 @@ curl -X POST http://localhost:8080/productions \
 # 409 {"error":{"code":"BATCH_QUARANTINED","message":"批次 'MIX-1' 已隔离，隔离批次不得再投料"}}
 ```
 
-### 7. 整笔拒绝示例（余量不足时不产生副作用）
+### 7. 质检复核：撤销误报并重算隔离
+
+```bash
+curl -X POST http://localhost:8080/reviews \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: review-20260930-01' \
+  -d '{"batch_no":"RM-A","note":"复检合格，农残未超标，判定误报"}'
+```
+
+```json
+{
+  "reviewed": {
+    "batch_no": "RM-A",
+    "is_suspect": false,
+    "is_quarantined": false,
+    "review_note": "复检合格，农残未超标，判定误报"
+  },
+  "affected_descendant_nos": ["FG-1", "MIX-1"],
+  "released_batch_nos": ["FG-1", "MIX-1", "RM-A"]
+}
+```
+
+- `reviewed`：本次复核的批次及其重算后的疑似/隔离状态、复核说明；
+- `affected_descendant_nos`：涉及的全部后代（按层数排序）；
+- `released_batch_nos`：本次**实际解除隔离**的批次；为空表示复核批次仍被其他疑似祖先连带隔离。
+
+只接受当前疑似批次，失败不改状态：
+
+```bash
+# 编号不存在
+curl -i -X POST http://localhost:8080/reviews \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: rv-x' \
+  -d '{"batch_no":"GHOST","note":"复核"}'
+# 404 {"error":{"code":"SOURCE_NOT_FOUND", ...}}
+
+# 已撤销（或从未疑似）：明确报错且状态不变
+curl -i -X POST http://localhost:8080/reviews \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: rv-again' \
+  -d '{"batch_no":"RM-A","note":"再次复核"}'
+# 409 {"error":{"code":"BATCH_NOT_SUSPECT", ...}}
+```
+
+混料场景：`MIX-1` 由 `RM-A` 与 `RM-B` 混料，两者都疑似时只解除 `RM-A`，
+`MIX-1` 与下游 `FG-1` 仍因 `RM-B` 保持隔离（本次 `released_batch_nos` 仅含 `RM-A`）：
+
+```bash
+curl -X POST http://localhost:8080/reviews \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: rv-a' \
+  -d '{"batch_no":"RM-A","note":"RM-A 误报"}'
+# {"reviewed":{"batch_no":"RM-A","is_suspect":false,"is_quarantined":false,...},
+#  "affected_descendant_nos":["FG-1","MIX-1"],
+#  "released_batch_nos":["RM-A"]}
+```
+
+复核后 `GET /batches/{batch_no}` 与 `GET /batches/{batch_no}/lineage`
+中的 `is_suspect` / `is_quarantined` 同步反映变化；解除隔离的批次可再次投料。
+同键同内容重试安全返回首次结果（即使批次此刻已非疑似也不会报 `BATCH_NOT_SUSPECT`），
+同键异内容返回 `409 IDEMPOTENCY_CONFLICT`。
+
+### 8. 整笔拒绝示例（余量不足时不产生副作用）
 
 ```bash
 # RM-A 当前余量 60，却请求消耗 200
@@ -235,14 +304,14 @@ curl -i -X POST http://localhost:8080/productions \
 app/
   config.py       # 环境变量配置
   db.py           # 引擎/会话、SQLite 写锁与 PG 行锁支撑、建表
-  models.py       # batches / productions / production_inputs / idempotency_keys
+  models.py       # batches / productions / production_inputs / contamination_reviews / idempotency_keys
   schemas.py      # Pydantic 请求响应模型（正数、定点数校验）
   errors.py       # 业务错误码
-  service.py      # 核心逻辑：登记、生产事务、幂等、递归谱系、污染传播
+  service.py      # 核心逻辑：登记、生产事务、幂等、递归谱系、污染传播、复核重算
   routes.py       # HTTP 路由
   main.py         # FastAPI 应用与异常处理
   entrypoint.py   # 容器入口：等待数据库 → 建表 → 启动
-tests/            # 端到端 + 并发测试（19 个用例）
+tests/            # 端到端 + 并发测试（35 个用例）
 Dockerfile
 docker-compose.yml
 ```
@@ -253,4 +322,7 @@ docker-compose.yml
   余量与产出总量，全部通过后才扣减并写入产出；任一校验失败立即回滚。
 - PostgreSQL 依赖 `SELECT ... FOR UPDATE` 行锁串行化同一批次的扣减；
   SQLite 写事务以 `BEGIN IMMEDIATE` 开始并设置 `busy_timeout`，写操作全局串行。
+- 复核撤销在单事务内锁定“复核批次 + 全部后代”后再重算隔离，与污染标记、生产投料
+  并发时三方互斥于同一批行锁，结果等同某一串行顺序；隔离状态依据递归谱系实时重算，
+  混料批次的另一疑似来源在子树之外也会被上溯识别，不会被错误解除。
 - 幂等记录与业务数据在同一事务内落库，唯一约束 `(method, path, key)` 兜底并发首请求竞争。
