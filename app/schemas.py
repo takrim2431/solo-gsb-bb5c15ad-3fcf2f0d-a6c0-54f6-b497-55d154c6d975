@@ -7,7 +7,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 
 def _to_decimal(value: object) -> Decimal:
@@ -53,6 +53,18 @@ class ProductionIn(BaseModel):
 class SuspectIn(BaseModel):
     batch_no: BatchNo
     note: str | None = Field(default=None, max_length=255)
+
+
+class ReviewIn(BaseModel):
+    batch_no: BatchNo
+    review_note: str = Field(min_length=1, max_length=1000, examples=["复检合格：留样复测未检出农残"])
+
+    @field_validator("review_note")
+    @classmethod
+    def _note_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("复核说明不得为空白")
+        return value
 
 
 # ---------- 响应 ----------
@@ -105,3 +117,12 @@ class DescendantsOut(BaseModel):
     is_suspect: bool
     affected_batch_nos: list[str]
     newly_quarantined: list[str]
+
+
+class ReviewOut(BaseModel):
+    reviewed_batch_no: str
+    is_suspect: bool
+    review_note: str
+    affected_batch_nos: list[str]
+    released_batch_nos: list[str]
+    still_quarantined: list[str]

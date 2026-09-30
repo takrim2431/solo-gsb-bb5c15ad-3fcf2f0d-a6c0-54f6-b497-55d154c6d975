@@ -104,6 +104,27 @@ class ProductionInput(Base):
     )
 
 
+class BatchReview(Base):
+    """质检复核记录：确认某疑似批次为误报后撤销其疑似标记。
+
+    每个批次至多一条有效复核；被复核批次必须当时处于疑似状态。
+    复核只撤销“自身疑似”，隔离状态随后按谱系重算（混料来源仍疑似的批次继续隔离）。
+    """
+
+    __tablename__ = "batch_reviews"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False, unique=True
+    )
+    review_note: Mapped[str] = mapped_column(Text, nullable=False)
+    reviewed_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    batch: Mapped[Batch] = relationship(foreign_keys=[batch_no])
+
+
 class IdempotencyKey(Base):
     """请求幂等记录。
 

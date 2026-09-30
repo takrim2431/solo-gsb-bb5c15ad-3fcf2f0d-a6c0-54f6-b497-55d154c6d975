@@ -35,6 +35,15 @@ def batch_quarantined(batch_no: str) -> AppError:
     )
 
 
+def batch_not_suspect(batch_no: str) -> AppError:
+    return AppError(
+        "BATCH_NOT_SUSPECT",
+        f"批次 {batch_no!r} 当前不是疑似批次（编号不存在或已复核撤销），无可撤销的疑似标记",
+        409,
+        details={"batch_no": batch_no},
+    )
+
+
 def insufficient(batch_no: str, requested: object, remaining: object) -> AppError:
     return AppError(
         "INSUFFICIENT_BALANCE",
